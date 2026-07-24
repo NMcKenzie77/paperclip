@@ -1,0 +1,41 @@
+name: Remove Moved ARKON Control Room Files
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/remove-arkon-control-room-files.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Paperclip fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Remove ARKON-specific control-room files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf arkon-development deploy/aws
+          rm -f .github/workflows/remove-arkon-control-room-files.yml
+
+      - name: Commit cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No cleanup changes to commit."
+            exit 0
+          fi
+          git commit -m "Move ARKON control room files to separate repository"
+          git push
