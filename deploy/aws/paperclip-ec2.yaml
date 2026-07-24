@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Deploy Paperclip on one Amazon Linux 2023 EC2 instance with an Elastic IP,
+  encrypted browser access, persistent EBS storage, and Systems Manager access.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that contains the public subnet.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet with a route to an internet gateway.
+
+  AllowedCidr:
+    Type: String
+    Description: Current operator public IPv4 address in CIDR form, for example 203.0.113.10/32.
+    AllowedPattern: "^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])$"
+
+  InstanceType:
+    Type: String
+    Default: m7i-flex.large
+    Description: EC2 instance type. Use an instance AWS marks Free Tier eligible for your account.
+
+  RootVolumeSize:
+    Type: Number
+    Default: 30
+    MinValue: 30
+    MaxValue: 200
+    Description: Root gp3 volume size in GiB.
+
+  PaperclipRef:
+    Type: String
+    Default: master
+    AllowedPattern: "^[A-Za-z0-9._/-]+$"
+    Description: Branch, tag, or commit to build from NMcKenzie77/paperclip.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 x86_64 AMI from the AWS public SSM parameter.
+
+Resources:
+  PaperclipRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Application
+          Value: ARKON-Paperclip
+
+  PaperclipInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref PaperclipRole
+
+  PaperclipSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Restrict Paperclip HTTPS access to the operator IP.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Paperclip browser access
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedCidr
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: arkon-paperclip
+        - Key: Application
+          Value: ARKON-Paperclip
+
+  PaperclipElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: arkon-paperclip
+        - Key: Application
+          Value: ARKON-Paperclip
+
+  PaperclipInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref PaperclipInstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref PaperclipSecurityGroup
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: arkon-paperclip
+        - Key: Application
+          Value: ARKON-Paperclip
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              exec > >(tee /var/log/paperclip-bootstrap.log | logger -t paperclip-bootstrap -s 2>/dev/console) 2>&1
+
+              PUBLIC_IP='${PublicIp}'
+              PAPERCLIP_REF='${PaperclipRefValue}'
+
+              dnf update -y
+              dnf install -y docker git nginx openssl jq curl
+              systemctl enable --now docker
+
+              if ! swapon --show | grep -q .; then
+                fallocate -l 8G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=8192
+                chmod 600 /swapfile
+                mkswap /swapfile
+                swapon /swapfile
+                echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+              fi
+              sysctl vm.swappiness=20
+
+              mkdir -p /opt/paperclip/data /opt/paperclip/tls
+              chown -R 1000:1000 /opt/paperclip/data
+
+              rm -rf /opt/paperclip/src
+              git clone --depth 1 --branch "$PAPERCLIP_REF" https://github.com/NMcKenzie77/paperclip.git /opt/paperclip/src
+
+              cd /opt/paperclip/src
+              DOCKER_BUILDKIT=1 docker build --pull -t arkon-paperclip:latest .
+              docker image prune -f
+
+              if [ ! -f /opt/paperclip/better-auth-secret ]; then
+                openssl rand -hex 32 > /opt/paperclip/better-auth-secret
+                chmod 600 /opt/paperclip/better-auth-secret
+              fi
+              BETTER_AUTH_SECRET=$(cat /opt/paperclip/better-auth-secret)
+
+              cat > /opt/paperclip/paperclip.env <<EOF
+              HOST=0.0.0.0
+              PORT=3100
+              SERVE_UI=true
+              PAPERCLIP_HOME=/paperclip
+              PAPERCLIP_INSTANCE_ID=default
+              PAPERCLIP_DEPLOYMENT_MODE=authenticated
+              PAPERCLIP_DEPLOYMENT_EXPOSURE=private
+              PAPERCLIP_PUBLIC_URL=https://$PUBLIC_IP
+              BETTER_AUTH_SECRET=$BETTER_AUTH_SECRET
+              EOF
+              chmod 600 /opt/paperclip/paperclip.env
+
+              docker rm -f paperclip || true
+              docker run -d \
+                --name paperclip \
+                --restart unless-stopped \
+                --env-file /opt/paperclip/paperclip.env \
+                -p 127.0.0.1:3100:3100 \
+                -v /opt/paperclip/data:/paperclip \
+                arkon-paperclip:latest
+
+              openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 825 \
+                -keyout /opt/paperclip/tls/paperclip.key \
+                -out /opt/paperclip/tls/paperclip.crt \
+                -subj "/CN=$PUBLIC_IP" \
+                -addext "subjectAltName=IP:$PUBLIC_IP"
+              chmod 600 /opt/paperclip/tls/paperclip.key
+
+              cat > /etc/nginx/conf.d/paperclip.conf <<'NGINX'
+              map $http_upgrade $connection_upgrade {
+                default upgrade;
+                '' close;
+              }
+
+              server {
+                listen 443 ssl;
+                server_name _;
+
+                ssl_certificate /opt/paperclip/tls/paperclip.crt;
+                ssl_certificate_key /opt/paperclip/tls/paperclip.key;
+                ssl_protocols TLSv1.2 TLSv1.3;
+
+                client_max_body_size 100m;
+
+                location / {
+                  proxy_pass http://127.0.0.1:3100;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto https;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection $connection_upgrade;
+                  proxy_read_timeout 3600;
+                  proxy_send_timeout 3600;
+                }
+              }
+              NGINX
+
+              nginx -t
+              systemctl enable --now nginx
+
+              READY=0
+              for attempt in $(seq 1 180); do
+                if curl -skf https://127.0.0.1/api/health >/dev/null 2>&1; then
+                  READY=1
+                  break
+                fi
+                sleep 10
+              done
+
+              if [ "$READY" -eq 1 ]; then
+                date -u +%FT%TZ > /opt/paperclip/READY
+              else
+                docker logs --tail 300 paperclip || true
+                touch /opt/paperclip/FAILED
+                exit 1
+              fi
+            - PublicIp: !Ref PaperclipElasticIp
+              PaperclipRefValue: !Ref PaperclipRef
+
+  PaperclipElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt PaperclipElasticIp.AllocationId
+      InstanceId: !Ref PaperclipInstance
+
+Outputs:
+  PaperclipUrl:
+    Description: Open this URL from the allowed public IP. The certificate is self-signed for the first setup.
+    Value: !Sub https://${PaperclipElasticIp}
+
+  InstanceId:
+    Description: EC2 instance ID for Systems Manager administration.
+    Value: !Ref PaperclipInstance
+
+  ElasticIp:
+    Description: Static public IP assigned to Paperclip.
+    Value: !Ref PaperclipElasticIp
+
+  AllowedCidr:
+    Description: Browser source network currently allowed by the security group.
+    Value: !Ref AllowedCidr
